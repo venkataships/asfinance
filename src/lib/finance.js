@@ -1,4 +1,5 @@
 import { normalizePayrollAutoSync, sanitizePayrollAutoSyncForDb } from './payrollSync.js';
+import { normalizeOptionsDesk, sanitizeOptionsDeskForDb } from './optionsDeskSchema.js';
 
 export const ACCOUNT_CATEGORIES = {
   retirement_401k: {
@@ -1107,6 +1108,7 @@ export function normalizePaystubDetails(raw) {
     spouse: normalizeOnePersonPaystub(src.spouse),
     tax_planning: normalizeTaxPlanning(src.tax_planning),
     payroll_autosync: normalizePayrollAutoSync(src.payroll_autosync),
+    options_desk: normalizeOptionsDesk(src.options_desk),
   };
 }
 
@@ -1181,6 +1183,7 @@ export function sanitizePaystubDetailsForDb(raw) {
     spouse: cleanPerson(norm.spouse),
     tax_planning: cleanTaxPlanning,
     payroll_autosync: sanitizePayrollAutoSyncForDb(norm.payroll_autosync),
+    options_desk: sanitizeOptionsDeskForDb(norm.options_desk),
   };
 }
 

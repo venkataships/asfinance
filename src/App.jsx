@@ -20,6 +20,7 @@ import {
   Target,
   Sun,
   Moon,
+  Compass,
 } from 'lucide-react';
 import { supabase } from './lib/supabase';
 import { seedDemoVaultData } from './lib/demoSeed';
@@ -33,9 +34,11 @@ import {
 } from './lib/finance';
 import {
   computePendingPayrollBatch,
+  daysBetweenIso,
   executePayrollSyncBatch,
   formatShortDate,
 } from './lib/payrollSync';
+import { normalizeOptionsDesk } from './lib/optionsDeskSchema';
 import {
   isPersistedScreenLocked,
   loadLockSettings,
@@ -53,6 +56,7 @@ import PaystubProfileCard from './components/PaystubProfileCard';
 import ActionableInsightsDashboard, {
   buildActionableInsights,
 } from './components/ActionableInsightsDashboard';
+import CapitalDeskTab from './components/CapitalDeskTab';
 import SecurityTab from './components/SecurityTab';
 
 function AuthenticatedVault({
@@ -564,6 +568,26 @@ function AuthenticatedVault({
     return res.urgentCount;
   }, [accounts, equityHoldings, creditCardPromos, expenses, recurringBills, budgets, taxProfile, householdNames]);
 
+  const optionsAlertCount = useMemo(() => {
+    const desk = normalizeOptionsDesk(taxProfile?.paystub_details?.options_desk);
+    const today = todayIsoDate();
+    let alerts = 0;
+    for (const pos of desk.positions || []) {
+      if (pos.status !== 'open') continue;
+      const dteLeft = pos.expiration ? daysBetweenIso(today, pos.expiration) : null;
+      const h = (equityHoldings || []).find(
+        (x) => String(x.symbol || '').trim().toUpperCase() === pos.symbol && toNumber(x.last_price) > 0
+      );
+      const spot = h ? toNumber(h.last_price) : 0;
+      const isItm =
+        spot > 0 &&
+        pos.strike > 0 &&
+        (pos.strategy === 'cc' ? spot > pos.strike : spot < pos.strike);
+      if (isItm || (dteLeft !== null && dteLeft <= 7)) alerts += 1;
+    }
+    return alerts;
+  }, [taxProfile, equityHoldings]);
+
   const handleQuickPostAllDuePayroll = useCallback(async () => {
     if (!pendingPayrollBatch.dueItems.length || !session?.user?.id) return;
     setPostingTopBannerSync(true);
@@ -645,6 +669,7 @@ function AuthenticatedVault({
     { key: 'overview', label: 'Overview', icon: LayoutDashboard },
     { key: 'insights', label: 'Insights', icon: Target, badge: insightsUrgentCount },
     { key: 'accounts', label: 'Accounts', icon: Wallet },
+    { key: 'strategies', label: 'Strategies', icon: Compass, badge: optionsAlertCount },
     { key: 'income', label: 'Pay & Taxes', icon: Briefcase },
     { key: 'expenses', label: 'Expenses', icon: Receipt },
     { key: 'advisor', label: 'AI Advisor', icon: Sparkles },
@@ -714,7 +739,7 @@ function AuthenticatedVault({
                     key={item.key}
                     type="button"
                     onClick={() => setActiveTab(item.key)}
-                    className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition ${
+                    className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium transition ${
                       active
                         ? 'bg-zinc-800/90 text-zinc-100'
                         : 'text-zinc-400 hover:bg-zinc-900 hover:text-zinc-200'
@@ -735,7 +760,10 @@ function AuthenticatedVault({
 
           <div className="flex flex-wrap items-center gap-2">
             {/* Household Scope Switcher */}
-            {activeTab !== 'security' && activeTab !== 'income' && activeTab !== 'insights' && (
+            {activeTab !== 'security' &&
+              activeTab !== 'income' &&
+              activeTab !== 'insights' &&
+              activeTab !== 'strategies' && (
               <div className="flex items-center gap-1 rounded-lg border border-zinc-800 bg-zinc-950 p-0.5 text-[11px]">
                 <Users className="ml-1.5 mr-0.5 hidden h-3.5 w-3.5 text-zinc-500 sm:inline" />
                 {scopeOptions.map((opt) => (
@@ -1055,6 +1083,24 @@ function AuthenticatedVault({
                 setBatchModalOpen={setBatchModalOpen}
                 newAccountCategory={newAccountCategory}
                 setNewAccountCategory={setNewAccountCategory}
+              />
+            )}
+
+            {activeTab === 'strategies' && (
+              <CapitalDeskTab
+                supabase={supabase}
+                session={session}
+                accounts={accounts}
+                equityHoldings={equityHoldings}
+                promos={creditCardPromos}
+                expenses={expenses}
+                recurringBills={recurringBills}
+                taxProfile={taxProfile}
+                householdNames={householdNames}
+                privacyMode={privacyMode}
+                onDataChanged={() => loadAllData()}
+                onNavigateTab={handleNavigateTab}
+                onAskAdvisor={handleAskAdvisorWithPrompt}
               />
             )}
 

@@ -515,7 +515,7 @@ export function buildActionableInsights({
       steps: [
         'In NY, Treasury-only funds (SGOV/USFR/FDLXX) avoid NY state income tax (~6%+), boosting after-tax yield vs standard bank HYSA.',
       ],
-      navAction: { label: 'Inspect Brokerage', tab: 'accounts', categoryFilter: 'investment' },
+      navAction: { label: 'Open Capital Desk', tab: 'strategies' },
       aiPrompt: `We have ${formatCurrency(brokerageCash, { decimals: 0 })} in uninvested brokerage cash. Should we park it in NY state-tax-exempt T-Bills (SGOV/USFR), run conservative CSPs, or allocate to index funds/0% promo payoff?`,
     });
   }
@@ -538,7 +538,7 @@ export function buildActionableInsights({
             ]
           : []),
       ],
-      navAction: { label: 'Open Holdings', tab: 'accounts', categoryFilter: 'investment' },
+      navAction: { label: 'Open Capital Desk', tab: 'strategies' },
       aiPrompt: `Design a conservative Covered Call plan for our eligible 100-share lots (${ccLots.map((l) => `${l.symbol}: ${l.shares} shares`).join(', ')}) factoring in earnings risk and our capital loss carryforward.`,
     });
   }

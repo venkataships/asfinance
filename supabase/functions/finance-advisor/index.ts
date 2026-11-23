@@ -1184,6 +1184,32 @@ function buildSanitizedFinancialContext(params: {
           max_contracts: h.covered_call_contracts_eligible,
           price_usd: h.price_usd,
         })),
+      ...(() => {
+        const rawDesk = (tpDetails?.options_desk || {}) as Record<string, unknown>;
+        const rawPositions = Array.isArray(rawDesk.positions)
+          ? (rawDesk.positions as Array<Record<string, unknown>>)
+          : [];
+        const openPositions = rawPositions
+          .filter((p) => p && p.status === 'open')
+          .slice(0, 20)
+          .map((p) => ({
+            strategy: String(p.strategy || 'csp'),
+            symbol: String(p.symbol || ''),
+            contracts: num(p.contracts),
+            strike: num(p.strike),
+            long_strike: num(p.long_strike) > 0 ? num(p.long_strike) : undefined,
+            expiration: String(p.expiration || ''),
+            credit_per_share: num(p.premium_per_share),
+            cost_basis: num(p.cost_basis) > 0 ? num(p.cost_basis) : undefined,
+          }));
+        return {
+          options_desk_risk_profile:
+            typeof rawDesk.risk_profile === 'string' ? rawDesk.risk_profile : undefined,
+          options_desk_reserve_months:
+            num(rawDesk.reserve_months) > 0 ? num(rawDesk.reserve_months) : undefined,
+          active_tracked_options: openPositions.length > 0 ? openPositions : undefined,
+        };
+      })(),
     },
     active_zero_pct_promos: activePromos,
     recent_monthly_expenses: recentMonths,
@@ -1328,7 +1354,7 @@ Deno.serve(async (req: Request) => {
       '2. Be concrete, quantitative, and structured: use clear Markdown headings, bullet points, exact dollar figures, percentages, and prioritized action steps.',
       '3. Tax & Paystub Optimization ("tax cheat codes"): Analyze 2026 IRS & OBBBA rules ($24,500 employee 401k Trad+Roth, $72,000 total 415(c) Mega Backdoor Roth, HSA $4,400 self / $8,750 family incl. employer seed, Healthcare FSA $3,400 / LPFSA rules, Dependent Care FSA $7,500 MFJ / $3,750 MFS, ESPP §423 $25,000 FMV limit & qualifying disposition, Social Security wage base $184,500, standard deduction $32,200 MFJ / $16,100 single, OBBBA 2026 SALT cap $40,400 phasing down 30% above $505,000 MAGI to $10,000 floor, Child Tax Credit $2,200 phasing out above $400,000 MFJ, $1,000 Section 530A newborn Trump Account seed via Form 4547). When populated, audit itemized deductions vs. W-4 Step 4(b) deductions, state withholding allowances (for NY IT-2104, remember NY Schedule A excludes NY state income tax and phases out itemized deductions at higher NY AGI, and NY 529 offers up to $10,000/yr MFJ NY deduction), 2025 prior-year Safe Harbor (110% if 2025 AGI > $150k MFJ, or 90% of current-year tax), capital loss carryforward strategy ($3,000 ordinary offset + unlimited tax-free capital gain shielding for post-vest RSUs, covered call assignments, or rebalancing), upcoming baby timing (Dec 31 vs. Jan 1 tax-year cutoff, 30-day QLE for Family HSA & DCFSA, two-plan-year delivery OOP max & NY PFL), and US/India cross-border reporting reminders (FBAR/Form 8938) when India assets exist.',
       '4. Debt & 0% Promos: Always flag upcoming 0% balance transfer expirations and compute exact monthly payoff cash needed vs. liquid cash runway, and compare mortgage/auto loan APRs against after-tax risk-free yield.',
-      '5. Covered Calls (CC) & Cash-Secured Puts (CSP): STRICT COMPLIANCE GUARDRAIL: NEVER recommend covered calls, cash-secured puts, collars, short sales, margin pledging, or any options/hedging trades on any ticker listed in options_income_readiness.employer_restricted_no_options_tickers (employer stock from RSU/ESPP grants across any household account), as corporate insider trading policies ban employee and household member derivatives on company stock. For restricted employer shares, only discuss outright sales/diversification during open trading windows and ESPP qualifying disposition timing. Otherwise, ONLY reference non-restricted eligible 100-share lots in covered_call_eligible_lots or actual available cash, and emphasize strict risk management (position sizing, avoiding earnings week, 20–30 delta OTM strikes, 30–45 DTE, assignment tax consequences on low-basis stock, and never risking emergency fund cash).',
+      '5. Covered Calls (CC), Cash-Secured Puts (CSP) & Capital Deployment: STRICT COMPLIANCE GUARDRAIL: NEVER recommend covered calls, cash-secured puts, collars, short sales, margin pledging, or any options/hedging trades on any ticker listed in options_income_readiness.employer_restricted_no_options_tickers (employer stock from RSU/ESPP grants across any household account), as corporate insider trading policies ban employee and household member derivatives on company stock. For restricted employer shares, only discuss outright sales/diversification during open trading windows and ESPP qualifying disposition timing. Otherwise, ONLY reference non-restricted eligible 100-share lots in covered_call_eligible_lots, actual available brokerage/IRA cash, and any tracked open trades in options_income_readiness.active_tracked_options. Emphasize low-to-medium risk discipline (position sizing, avoiding earnings week, 15–25 delta OTM strikes, 30–45 DTE, Treasury/SGOV/FDLXX state-tax-free double-dip collateral, defined-risk Put Credit Spreads for expensive tickers, and never risking emergency fund or 0% promo payoff cash). When a trade moves ITM or against the user, quantitatively compare (a) rolling up/down & out for a net credit (checking annualized roll yield on added days), (b) accepting assignment / Wheel transition (factoring capital loss carryforward tax shield), vs (c) closing for a loss (warning on the 30-day IRS wash-sale rule across taxable & IRA accounts).',
       '6. Privacy & Safety: Never ask for SSN, home street address, full account numbers, or passwords. Include a brief one-line reminder on major tax/legal strategies to verify with a CPA when executing.',
       '',
       '=== LIVE HOUSEHOLD FINANCIAL SNAPSHOT (ANONYMIZED, RLS-VERIFIED) ===',
