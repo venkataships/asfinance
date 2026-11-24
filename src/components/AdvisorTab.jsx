@@ -41,6 +41,13 @@ const MODELS = [
     desc: 'Strongest Anthropic reasoning for complex multi-year tax & wealth plans',
   },
   {
+    id: 'gemini-4-neon-medium',
+    provider: 'gemini',
+    label: 'Gemini 4 Neon (Med)',
+    badge: 'Frontier • Gemini',
+    desc: 'Gemini 4 Neon with Medium thinking — frontier reasoning with fast responses',
+  },
+  {
     id: 'gemini-4-hydrogen',
     provider: 'gemini',
     label: 'Gemini 4 Hydrogen',

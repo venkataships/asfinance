@@ -1,6 +1,6 @@
 import 'jsr:@supabase/functions-js/edge-runtime.d.ts';
 import { createClient } from 'jsr:@supabase/supabase-js@2';
-import { GoogleGenAI } from 'npm:@google/genai@^3.2.0';
+import { GoogleGenAI } from 'npm:@google/genai@^3.5.0';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -29,6 +29,13 @@ const ALLOWED_MODELS = [
     label: 'Claude Sonnet 5.5',
     badge: 'Deep CFO • Anthropic',
     description: 'Flagship Anthropic reasoning for complex tax & wealth strategy',
+  },
+  {
+    id: 'gemini-4-neon-medium',
+    provider: 'gemini',
+    label: 'Gemini 4 Neon (Med)',
+    badge: 'Frontier • Gemini',
+    description: 'Gemini 4 Neon with Medium thinking — frontier reasoning with fast responses',
   },
   {
     id: 'gemini-4-hydrogen',
@@ -1430,15 +1437,27 @@ Deno.serve(async (req: Request) => {
 
     const ai = new GoogleGenAI({ apiKey: geminiKey });
 
-    const callModel = async (targetModel: string) => {
+    const resolveGeminiRequest = (targetModelId: string) => {
+      if (targetModelId === 'gemini-4-neon-medium') {
+        return {
+          apiModel: 'gemini-4-neon',
+          generationConfig: { thinking_level: 'medium' as const },
+        };
+      }
+      return { apiModel: targetModelId, generationConfig: undefined };
+    };
+
+    const callModel = async (targetModelId: string) => {
+      const { apiModel, generationConfig } = resolveGeminiRequest(targetModelId);
       return await ai.interactions.create(
         {
-          model: targetModel,
+          model: apiModel,
           store: false,
           system_instruction: systemInstruction,
           input: steps,
+          ...(generationConfig ? { generation_config: generationConfig } : {}),
         },
-        { maxRetries: 0, timeout: 25000 }
+        { maxRetries: 0, timeout: 45000 }
       );
     };
 
