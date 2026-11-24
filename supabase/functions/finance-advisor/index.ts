@@ -1665,7 +1665,6 @@ Deno.serve(async (req: Request) => {
                 const res = await streamGeminiModel(
                   ai,
                   model,
-                  systemInstruction,
                   onDelta,
                   false,
                   105000
@@ -1698,7 +1697,6 @@ Deno.serve(async (req: Request) => {
                       const res = await streamGeminiModel(
                         ai,
                         fbModel,
-                        systemInstruction,
                         onDelta,
                         true,
                         30000
