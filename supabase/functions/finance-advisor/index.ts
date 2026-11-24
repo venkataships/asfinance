@@ -76,11 +76,11 @@ const ALLOWED_MODELS = [
 
 const ALLOWED_MODEL_IDS = new Set<string>(ALLOWED_MODELS.map((m) => m.id));
 
-async function callAnthropicModel(
-  apiKey: string,
+function buildAnthropicRequestPayload(
   targetModel: string,
   systemInstruction: string,
-  cleanedMessages: Array<{ role: string; text: string }>
+  cleanedMessages: Array<{ role: string; text: string }>,
+  stream = false
 ) {
   // Normalize into strictly alternating user/assistant turns starting with user
   const normalized: Array<{ role: 'user' | 'assistant'; text: string }> = [];
@@ -119,6 +119,20 @@ async function callAnthropicModel(
     reqPayload.thinking = { type: 'adaptive' };
     reqPayload.output_config = { effort: 'medium' };
   }
+  if (stream) {
+    reqPayload.stream = true;
+  }
+  return reqPayload;
+}
+
+async function callAnthropicModel(
+  apiKey: string,
+  targetModel: string,
+  systemInstruction: string,
+  cleanedMessages: Array<{ role: string; text: string }>,
+  timeoutMs = 90000
+) {
+  const reqPayload = buildAnthropicRequestPayload(targetModel, systemInstruction, cleanedMessages, false);
 
   const resp = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -128,7 +142,7 @@ async function callAnthropicModel(
       'anthropic-version': '2026-10-21',
     },
     body: JSON.stringify(reqPayload),
-    signal: AbortSignal.timeout(55000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
 
   const json = await resp.json().catch(() => ({}));
@@ -173,6 +187,96 @@ async function callAnthropicModel(
 
   return {
     reply: replyText,
+    usage: {
+      total_tokens: inputTokens + outputTokens,
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+    },
+  };
+}
+
+async function streamAnthropicModel(
+  apiKey: string,
+  targetModel: string,
+  systemInstruction: string,
+  cleanedMessages: Array<{ role: string; text: string }>,
+  onDelta: (chunk: string) => void,
+  timeoutMs = 105000
+) {
+  const reqPayload = buildAnthropicRequestPayload(targetModel, systemInstruction, cleanedMessages, true);
+
+  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2026-10-21',
+    },
+    body: JSON.stringify(reqPayload),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+
+  if (!resp.ok || !resp.body) {
+    const json = await resp.json().catch(() => ({}));
+    const errMsg =
+      (json as { error?: { message?: string } })?.error?.message ||
+      resp.statusText ||
+      'Anthropic API request failed';
+    throw new Error(`${resp.status} ${errMsg}`);
+  }
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let replyText = '';
+  let inputTokens = 0;
+  let outputTokens = 0;
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() ?? '';
+
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line.startsWith('data:')) continue;
+      const dataStr = line.slice(5).trim();
+      if (!dataStr || dataStr === '[DONE]') continue;
+
+      let evt: Record<string, unknown>;
+      try {
+        evt = JSON.parse(dataStr);
+      } catch {
+        continue;
+      }
+
+      if (evt.type === 'message_start') {
+        const msgUsage = (evt.message as { usage?: Record<string, unknown> } | undefined)?.usage;
+        if (msgUsage) {
+          inputTokens = Number(msgUsage.input_tokens ?? 0);
+        }
+      } else if (evt.type === 'content_block_delta') {
+        const delta = evt.delta as { type?: string; text?: string } | undefined;
+        if (delta?.type === 'text_delta' && typeof delta.text === 'string' && delta.text.length > 0) {
+          replyText += delta.text;
+          onDelta(delta.text);
+        }
+      } else if (evt.type === 'message_delta') {
+        const msgUsage = evt.usage as Record<string, unknown> | undefined;
+        if (msgUsage && msgUsage.output_tokens !== undefined) {
+          outputTokens = Number(msgUsage.output_tokens ?? 0);
+        }
+      } else if (evt.type === 'error') {
+        const errObj = evt.error as { message?: string } | undefined;
+        throw new Error(errObj?.message || 'Anthropic stream error');
+      }
+    }
+  }
+
+  return {
+    reply: replyText.trim(),
     usage: {
       total_tokens: inputTokens + outputTokens,
       input_tokens: inputTokens,
@@ -1295,7 +1399,7 @@ Deno.serve(async (req: Request) => {
           typeof (m as { text?: unknown }).text === 'string' &&
           (m as { text: string }).text.trim().length > 0
       )
-      .slice(-16);
+      .slice(-12);
 
     if (cleanedMessages.length === 0) {
       return jsonResp({ error: 'Please send at least one message.' }, 400);
@@ -1306,6 +1410,7 @@ Deno.serve(async (req: Request) => {
     const provider = model.startsWith('claude-') ? 'anthropic' : 'gemini';
     const scope = String(body?.scope || 'combined');
     const includeNotes = Boolean(body?.includeNotes);
+    const wantStream = Boolean(body?.stream);
 
     if (provider === 'anthropic' && !anthropicKey) {
       return jsonResp({
@@ -1363,11 +1468,303 @@ Deno.serve(async (req: Request) => {
       '4. Debt & 0% Promos: Always flag upcoming 0% balance transfer expirations and compute exact monthly payoff cash needed vs. liquid cash runway, and compare mortgage/auto loan APRs against after-tax risk-free yield.',
       '5. Covered Calls (CC), Cash-Secured Puts (CSP) & Capital Deployment: STRICT COMPLIANCE GUARDRAIL: NEVER recommend covered calls, cash-secured puts, collars, short sales, margin pledging, or any options/hedging trades on any ticker listed in options_income_readiness.employer_restricted_no_options_tickers (employer stock from RSU/ESPP grants across any household account), as corporate insider trading policies ban employee and household member derivatives on company stock. For restricted employer shares, only discuss outright sales/diversification during open trading windows and ESPP qualifying disposition timing. Otherwise, ONLY reference non-restricted eligible 100-share lots in covered_call_eligible_lots, actual available brokerage/IRA cash, and any tracked open trades in options_income_readiness.active_tracked_options. Emphasize low-to-medium risk discipline (position sizing, avoiding earnings week, 15–25 delta OTM strikes, 30–45 DTE, Treasury/SGOV/FDLXX state-tax-free double-dip collateral, defined-risk Put Credit Spreads for expensive tickers, and never risking emergency fund or 0% promo payoff cash). When a trade moves ITM or against the user, quantitatively compare (a) rolling up/down & out for a net credit (checking annualized roll yield on added days), (b) accepting assignment / Wheel transition (factoring capital loss carryforward tax shield), vs (c) closing for a loss (warning on the 30-day IRS wash-sale rule across taxable & IRA accounts).',
       '6. Privacy & Safety: Never ask for SSN, home street address, full account numbers, or passwords. Include a brief one-line reminder on major tax/legal strategies to verify with a CPA when executing.',
+      '7. Keep responses concise and high-signal; avoid repetition or unnecessary filler so guidance stays crisp and actionable.',
       '',
       '=== LIVE HOUSEHOLD FINANCIAL SNAPSHOT (ANONYMIZED, RLS-VERIFIED) ===',
       jsonContext,
     ].join('\n');
 
+    const resolveGeminiRequest = (targetModelId: string, isFallback = false) => {
+      if (targetModelId === 'gemini-4-neon-medium') {
+        return {
+          apiModel: 'gemini-4-neon',
+          generationConfig: { thinking_level: 'medium' as const },
+        };
+      }
+      if (targetModelId === 'gemini-4-hydrogen') {
+        return {
+          apiModel: 'gemini-4-hydrogen',
+          generationConfig: { thinking_level: (isFallback ? 'low' : 'medium') as const },
+        };
+      }
+      return { apiModel: targetModelId, generationConfig: undefined };
+    };
+
+    const geminiSteps = cleanedMessages.map((m) => ({
+      type: m.role === 'assistant' ? ('model_output' as const) : ('user_input' as const),
+      content: [{ type: 'text' as const, text: m.text }],
+    }));
+
+    const streamGeminiModel = async (
+      ai: GoogleGenAI,
+      targetModelId: string,
+      onDelta: (chunk: string) => void,
+      isFallback = false,
+      timeoutMs = 105000
+    ) => {
+      const { apiModel, generationConfig } = resolveGeminiRequest(targetModelId, isFallback);
+      const stream = await ai.interactions.create(
+        {
+          model: apiModel,
+          store: false,
+          system_instruction: systemInstruction,
+          input: geminiSteps,
+          stream: true,
+          ...(generationConfig ? { generation_config: generationConfig } : {}),
+        },
+        { maxRetries: 0, timeout: timeoutMs }
+      );
+
+      let replyText = '';
+      let usage: unknown = null;
+
+      for await (const event of stream) {
+        if (event.event_type === 'step.delta') {
+          const delta = event.delta as { type?: string; text?: string } | undefined;
+          if (delta?.type === 'text' && typeof delta.text === 'string' && delta.text.length > 0) {
+            replyText += delta.text;
+            onDelta(delta.text);
+          }
+        } else if (event.event_type === 'interaction.completed') {
+          usage = event.interaction?.usage || null;
+          if (!replyText && event.interaction?.output_text) {
+            replyText = event.interaction.output_text;
+            onDelta(replyText);
+          }
+        } else if (
+          event.event_type === 'error' ||
+          ['failed', 'cancelled'].includes(String(event.interaction?.status || ''))
+        ) {
+          const errDetail =
+            (event as { error?: { message?: string } }).error?.message ||
+            (event.interaction as { error?: { message?: string } } | undefined)?.error?.message ||
+            `Gemini interaction ended with status ${event.interaction?.status || 'error'}`;
+          throw new Error(String(errDetail));
+        }
+      }
+
+      return { reply: replyText.trim(), usage };
+    };
+
+    const FAST_GEMINI_FALLBACKS = ['gemini-4-hydrogen', 'gemini-3.5-flash-lite'];
+    const reqStart = Date.now();
+
+    // =========================================================================
+    // LIVE SSE STREAMING PATH (Prevents Supabase 546 worker timeout)
+    // =========================================================================
+    if (wantStream) {
+      const encoder = new TextEncoder();
+      const bodyStream = new ReadableStream({
+        async start(controller) {
+          let closed = false;
+          const sendEvent = (obj: Record<string, unknown>) => {
+            if (closed) return;
+            try {
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
+            } catch {
+              closed = true;
+            }
+          };
+
+          const heartbeat = setInterval(() => {
+            if (closed) return;
+            try {
+              controller.enqueue(encoder.encode(': keepalive\n\n'));
+            } catch {
+              closed = true;
+            }
+          }, 8000);
+
+          try {
+            let emittedAnyText = false;
+            let usedModel = model;
+            let fallbackNote = '';
+            let finalReply = '';
+            let finalUsage: unknown = null;
+            const attempts: Array<{ model: string; error: string }> = [];
+
+            const onDelta = (chunk: string) => {
+              if (!chunk) return;
+              emittedAnyText = true;
+              sendEvent({ type: 'delta', text: chunk });
+            };
+
+            sendEvent({
+              type: 'status',
+              model,
+              text: `Thinking with ${ALLOWED_MODELS.find((x) => x.id === model)?.label || model}…`,
+            });
+
+            if (provider === 'anthropic') {
+              try {
+                const res = await streamAnthropicModel(
+                  anthropicKey,
+                  model,
+                  systemInstruction,
+                  cleanedMessages,
+                  onDelta,
+                  105000
+                );
+                finalReply = res.reply;
+                finalUsage = res.usage;
+              } catch (primaryErr) {
+                const primaryMsg =
+                  primaryErr instanceof Error ? primaryErr.message : String(primaryErr);
+                console.error(
+                  `[finance-advisor] Stream Anthropic ${model} failed:`,
+                  primaryMsg
+                );
+                attempts.push({ model, error: primaryMsg });
+
+                const shouldFallback =
+                  !emittedAnyText &&
+                  Date.now() - reqStart < 95000 &&
+                  model !== 'claude-haiku-4-5' &&
+                  /404|429|500|502|503|504|529|overloaded|not_found|not found|timeout|timed out|AbortError/i.test(
+                    primaryMsg
+                  );
+
+                if (shouldFallback) {
+                  try {
+                    sendEvent({
+                      type: 'status',
+                      model: 'claude-haiku-4-5',
+                      text: `${model} busy — switching to Claude Haiku 4.5…`,
+                    });
+                    const res = await streamAnthropicModel(
+                      anthropicKey,
+                      'claude-haiku-4-5',
+                      systemInstruction,
+                      cleanedMessages,
+                      onDelta,
+                      35000
+                    );
+                    usedModel = 'claude-haiku-4-5';
+                    fallbackNote = `${model} was temporarily unavailable or timed out. Answered automatically using Claude Haiku 4.5.`;
+                    finalReply = res.reply;
+                    finalUsage = res.usage;
+                  } catch (fbErr) {
+                    const fbMsg = fbErr instanceof Error ? fbErr.message : String(fbErr);
+                    attempts.push({ model: 'claude-haiku-4-5', error: fbMsg });
+                  }
+                }
+
+                if (!finalReply) {
+                  const detailText =
+                    attempts.length > 1
+                      ? 'Anthropic API error across models:\n' +
+                        attempts.map((a) => `• ${a.model}: ${a.error}`).join('\n')
+                      : `Anthropic API error (${model}): ${primaryMsg}`;
+                  sendEvent({ type: 'error', error: detailText });
+                  return;
+                }
+              }
+            } else {
+              const ai = new GoogleGenAI({ apiKey: geminiKey });
+              try {
+                const res = await streamGeminiModel(
+                  ai,
+                  model,
+                  systemInstruction,
+                  onDelta,
+                  false,
+                  105000
+                );
+                finalReply = res.reply;
+                finalUsage = res.usage;
+              } catch (primaryErr) {
+                const primaryMsg =
+                  primaryErr instanceof Error ? primaryErr.message : String(primaryErr);
+                console.error(`[finance-advisor] Stream Gemini ${model} failed:`, primaryMsg);
+                attempts.push({ model, error: primaryMsg });
+
+                const shouldFallback =
+                  !emittedAnyText &&
+                  Date.now() - reqStart < 95000 &&
+                  /429|500|502|503|504|RESOURCE_EXHAUSTED|quota|limit:\s*0|high demand|overloaded|timeout|timed out|AbortError|not found|404|permission|403/i.test(
+                    primaryMsg
+                  );
+
+                const chain = FAST_GEMINI_FALLBACKS.filter((m) => m !== model);
+                if (shouldFallback && chain.length > 0) {
+                  for (const fbModel of chain) {
+                    if (Date.now() - reqStart >= 110000) break;
+                    try {
+                      sendEvent({
+                        type: 'status',
+                        model: fbModel,
+                        text: `${model} busy/timed out — switching to ${fbModel}…`,
+                      });
+                      const res = await streamGeminiModel(
+                        ai,
+                        fbModel,
+                        systemInstruction,
+                        onDelta,
+                        true,
+                        30000
+                      );
+                      usedModel = fbModel;
+                      fallbackNote = `${model} was temporarily unavailable or timed out. Answered automatically using ${fbModel}.`;
+                      finalReply = res.reply;
+                      finalUsage = res.usage;
+                      break;
+                    } catch (fbErr) {
+                      const fbMsg = fbErr instanceof Error ? fbErr.message : String(fbErr);
+                      console.error(`[finance-advisor] Fallback stream ${fbModel} failed:`, fbMsg);
+                      attempts.push({ model: fbModel, error: fbMsg });
+                    }
+                  }
+                }
+
+                if (!finalReply) {
+                  const detailText =
+                    attempts.length > 1
+                      ? 'Gemini API error across models:\n' +
+                        attempts.map((a) => `• ${a.model}: ${a.error}`).join('\n')
+                      : `Gemini API error (${model}): ${primaryMsg}`;
+                  sendEvent({ type: 'error', error: detailText });
+                  return;
+                }
+              }
+            }
+
+            sendEvent({
+              type: 'done',
+              model: usedModel,
+              requestedModel: model,
+              fallbackNote: fallbackNote || undefined,
+              reply: finalReply,
+              usage: finalUsage,
+              contextStats: stats,
+            });
+          } catch (streamErr) {
+            const msg = streamErr instanceof Error ? streamErr.message : String(streamErr);
+            sendEvent({ type: 'error', error: msg });
+          } finally {
+            clearInterval(heartbeat);
+            closed = true;
+            try {
+              controller.close();
+            } catch {
+              // Ignore double-close
+            }
+          }
+        },
+      });
+
+      return new Response(bodyStream, {
+        status: 200,
+        headers: {
+          ...corsHeaders,
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache, no-transform',
+        },
+      });
+    }
+
+    // =========================================================================
+    // NON-STREAMING FALLBACK PATH (Backward compatible for older cached bundles)
+    // =========================================================================
     if (provider === 'anthropic') {
       let usedModel = model;
       let fallbackNote = '';
@@ -1375,13 +1772,20 @@ Deno.serve(async (req: Request) => {
       const attempts: Array<{ model: string; error: string }> = [];
 
       try {
-        result = await callAnthropicModel(anthropicKey, model, systemInstruction, cleanedMessages);
+        result = await callAnthropicModel(
+          anthropicKey,
+          model,
+          systemInstruction,
+          cleanedMessages,
+          90000
+        );
       } catch (primaryErr) {
         const primaryMsg = primaryErr instanceof Error ? primaryErr.message : String(primaryErr);
         console.error(`[finance-advisor] Primary Anthropic model ${model} failed:`, primaryMsg);
         attempts.push({ model, error: primaryMsg });
 
         const shouldFallback =
+          Date.now() - reqStart < 85000 &&
           /404|429|500|502|503|504|529|overloaded|not_found|not found|timeout|timed out|AbortError/i.test(
             primaryMsg
           );
@@ -1392,7 +1796,8 @@ Deno.serve(async (req: Request) => {
               anthropicKey,
               'claude-haiku-4-5',
               systemInstruction,
-              cleanedMessages
+              cleanedMessages,
+              35000
             );
             usedModel = 'claude-haiku-4-5';
             fallbackNote = `${model} was temporarily unavailable or unsupported on this endpoint. Answered automatically using claude-haiku-4-5.`;
@@ -1429,35 +1834,19 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    // Build stateless multi-turn Interactions API steps (store: false) for Gemini backup
-    const steps = cleanedMessages.map((m) => ({
-      type: m.role === 'assistant' ? ('model_output' as const) : ('user_input' as const),
-      content: [{ type: 'text' as const, text: m.text }],
-    }));
-
     const ai = new GoogleGenAI({ apiKey: geminiKey });
 
-    const resolveGeminiRequest = (targetModelId: string) => {
-      if (targetModelId === 'gemini-4-neon-medium') {
-        return {
-          apiModel: 'gemini-4-neon',
-          generationConfig: { thinking_level: 'medium' as const },
-        };
-      }
-      return { apiModel: targetModelId, generationConfig: undefined };
-    };
-
-    const callModel = async (targetModelId: string) => {
-      const { apiModel, generationConfig } = resolveGeminiRequest(targetModelId);
+    const callModel = async (targetModelId: string, isFallback = false, timeoutMs = 90000) => {
+      const { apiModel, generationConfig } = resolveGeminiRequest(targetModelId, isFallback);
       return await ai.interactions.create(
         {
           model: apiModel,
           store: false,
           system_instruction: systemInstruction,
-          input: steps,
+          input: geminiSteps,
           ...(generationConfig ? { generation_config: generationConfig } : {}),
         },
-        { maxRetries: 0, timeout: 45000 }
+        { maxRetries: 0, timeout: timeoutMs }
       );
     };
 
@@ -1467,29 +1856,25 @@ Deno.serve(async (req: Request) => {
     const attempts: Array<{ model: string; error: string }> = [];
 
     try {
-      interaction = await callModel(model);
+      interaction = await callModel(model, false, 90000);
     } catch (primaryErr) {
       const primaryMsg = primaryErr instanceof Error ? primaryErr.message : String(primaryErr);
       console.error(`[finance-advisor] Primary model ${model} failed:`, primaryMsg);
       attempts.push({ model, error: primaryMsg });
 
       const shouldFallback =
+        Date.now() - reqStart < 85000 &&
         /429|500|502|503|504|RESOURCE_EXHAUSTED|quota|limit:\s*0|high demand|overloaded|timeout|timed out|AbortError|not found|404|permission|403/i.test(
           primaryMsg
         );
 
-      const fallbackChain = [
-        'gemini-4-hydrogen',
-        'gemini-3.8-flash',
-        'gemini-3.5-flash-lite',
-        'gemini-3.1-flash-lite',
-        'gemma-4-31b-it',
-      ].filter((m) => m !== model);
+      const fallbackChain = FAST_GEMINI_FALLBACKS.filter((m) => m !== model);
 
       if (shouldFallback && fallbackChain.length > 0) {
         for (const fbModel of fallbackChain) {
+          if (Date.now() - reqStart >= 85000) break;
           try {
-            interaction = await callModel(fbModel);
+            interaction = await callModel(fbModel, true, 25000);
             usedModel = fbModel;
             fallbackNote = `${model} was temporarily unavailable or busy. Answered automatically using ${fbModel}.`;
             break;
@@ -1505,7 +1890,7 @@ Deno.serve(async (req: Request) => {
             configured: true,
             ok: false,
             error:
-              'All free-tier models are currently unavailable or busy:\n' +
+              'All Gemini models are currently unavailable or busy:\n' +
               attempts.map((a) => `• ${a.model}: ${a.error}`).join('\n'),
           });
         }

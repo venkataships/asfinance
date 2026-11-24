@@ -24,6 +24,7 @@ import {
   getEmployerRestrictedTickers,
   toNumber,
 } from '../lib/finance';
+import { supabasePublishableKey, supabaseUrl } from '../lib/supabase';
 
 const MODELS = [
   {
@@ -307,6 +308,8 @@ export default function AdvisorTab({
   const [messages, setMessages] = useState([]);
   const [draftInput, setDraftInput] = useState('');
   const [sending, setSending] = useState(false);
+  const [streamingText, setStreamingText] = useState('');
+  const [streamingStatus, setStreamingStatus] = useState('');
   const [chatError, setChatError] = useState('');
   const chatEndRef = useRef(null);
 
@@ -521,51 +524,142 @@ export default function AdvisorTab({
         .update({ updated_at: nowIso })
         .eq('id', threadId);
 
-      const { data, error } = await supabase.functions.invoke('finance-advisor', {
-        body: {
+      const selectedModelLabel =
+        MODELS.find((m) => m.id === selectedModel)?.label || selectedModel;
+      setStreamingText('');
+      setStreamingStatus(`Analyzing your household vault with ${selectedModelLabel}…`);
+
+      const { data: sessionData } = await supabase.auth.getSession();
+      const accessToken = sessionData?.session?.access_token;
+      if (!accessToken) {
+        throw new Error('Your secure session expired — please unlock or sign in again.');
+      }
+
+      const resp = await fetch(`${supabaseUrl}/functions/v1/finance-advisor`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          apikey: supabasePublishableKey,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
           action: 'chat',
+          stream: true,
           model: selectedModel,
           scope: householdScope,
           includeNotes,
           messages: nextHistory.map((m) => ({ role: m.role, text: m.text })),
-        },
+        }),
       });
-      if (error) {
-        let detailedMsg = error.message;
+
+      const contentType = resp.headers.get('content-type') || '';
+      if (!resp.ok) {
+        let detailedMsg = `Edge Function returned status ${resp.status}`;
         try {
-          if (error.context && typeof error.context.json === 'function') {
-            const errJson = await error.context.json();
+          if (contentType.includes('application/json')) {
+            const errJson = await resp.json();
             if (errJson?.error) detailedMsg = errJson.error;
+          } else {
+            const errText = await resp.text();
+            if (errText && errText.length < 300) detailedMsg = errText;
           }
         } catch {
-          // Keep default error.message
+          // Keep status message
         }
         throw new Error(detailedMsg);
       }
 
-      if (data?.configured === false) {
-        const missing = data?.missingProvider || selectedProvider;
-        setAdvisorStatus((prev) => ({
-          ...prev,
-          checking: false,
-          providers: { ...prev.providers, [missing]: false },
-        }));
-        setChatError(
-          data?.error ||
-            (missing === 'anthropic'
-              ? 'ANTHROPIC_API_KEY is not configured yet.'
-              : 'GEMINI_API_KEY is not configured yet.')
-        );
-        return;
+      let replyText = '';
+      let usedModel = selectedModel;
+      let fallbackNoteText = '';
+      let usageData = null;
+
+      if (contentType.includes('text/event-stream') && resp.body) {
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let streamError = '';
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() ?? '';
+
+          for (const rawLine of lines) {
+            const line = rawLine.trim();
+            if (!line.startsWith('data:')) continue;
+            const dataStr = line.slice(5).trim();
+            if (!dataStr || dataStr === '[DONE]') continue;
+
+            let evt;
+            try {
+              evt = JSON.parse(dataStr);
+            } catch {
+              continue;
+            }
+
+            if (evt.type === 'status') {
+              if (evt.text) setStreamingStatus(evt.text);
+            } else if (evt.type === 'delta') {
+              if (typeof evt.text === 'string' && evt.text.length > 0) {
+                replyText += evt.text;
+                setStreamingText(replyText);
+              }
+            } else if (evt.type === 'done') {
+              if (evt.model) usedModel = evt.model;
+              if (evt.fallbackNote) fallbackNoteText = evt.fallbackNote;
+              if (evt.usage) usageData = evt.usage;
+              if (!replyText && evt.reply) {
+                replyText = evt.reply;
+                setStreamingText(replyText);
+              }
+            } else if (evt.type === 'error') {
+              streamError = evt.error || 'AI Advisor stream failed.';
+            }
+          }
+        }
+
+        if (streamError && !replyText) {
+          throw new Error(streamError);
+        }
+        if (streamError && replyText) {
+          fallbackNoteText = fallbackNoteText
+            ? `${fallbackNoteText}\n${streamError}`
+            : streamError;
+        }
+        if (!replyText) {
+          replyText = 'No response returned.';
+        }
+      } else {
+        const data = await resp.json();
+        if (data?.configured === false) {
+          const missing = data?.missingProvider || selectedProvider;
+          setAdvisorStatus((prev) => ({
+            ...prev,
+            checking: false,
+            providers: { ...prev.providers, [missing]: false },
+          }));
+          setChatError(
+            data?.error ||
+              (missing === 'anthropic'
+                ? 'ANTHROPIC_API_KEY is not configured yet.'
+                : 'GEMINI_API_KEY is not configured yet.')
+          );
+          return;
+        }
+
+        if (data?.ok === false || data?.error) {
+          throw new Error(data.error || 'AI Advisor returned an error.');
+        }
+
+        replyText = data?.reply || 'No response returned.';
+        usedModel = data?.model || selectedModel;
+        fallbackNoteText = data?.fallbackNote || '';
+        usageData = data?.usage || null;
       }
 
-      if (data?.ok === false || data?.error) {
-        throw new Error(data.error || 'AI Advisor returned an error.');
-      }
-
-      const replyText = data?.reply || 'No response returned.';
-      const usedModel = data?.model || selectedModel;
-      const fallbackNoteText = data?.fallbackNote || '';
       const replyNowIso = new Date().toISOString();
 
       const { data: savedAssistantRow } = await supabase
@@ -576,7 +670,7 @@ export default function AdvisorTab({
           content: replyText,
           model: usedModel,
           fallback_note: fallbackNoteText || null,
-          usage: data?.usage || null,
+          usage: usageData,
         })
         .select('id, created_at')
         .single();
@@ -600,14 +694,16 @@ export default function AdvisorTab({
           text: replyText,
           model: usedModel,
           fallbackNote: fallbackNoteText,
-          usage: data?.usage || null,
+          usage: usageData,
           createdAt: savedAssistantRow?.created_at || replyNowIso,
         },
       ]);
     } catch (err) {
-      setChatError(err?.message || 'Gemini Advisor call failed.');
+      setChatError(err?.message || 'AI Advisor call failed.');
     } finally {
       setSending(false);
+      setStreamingText('');
+      setStreamingStatus('');
     }
   };
 
@@ -1253,15 +1349,30 @@ export default function AdvisorTab({
             ))
           )}
 
-          {sending && (
-            <div className="flex justify-start">
-              <div className="inline-flex items-center gap-2.5 rounded-2xl border border-zinc-800 bg-zinc-900/70 px-4 py-3 text-xs text-zinc-300">
-                <div className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-zinc-700 border-t-emerald-400" />
-                Analyzing your household balance sheet & tax profile with{' '}
-                {MODELS.find((m) => m.id === selectedModel)?.label}…
+          {sending &&
+            (streamingText ? (
+              <div className="flex justify-start">
+                <div className="max-w-[90%] rounded-2xl border border-emerald-500/30 bg-zinc-900/70 px-4 py-3 text-zinc-200 sm:max-w-[82%]">
+                  <div className="mb-2 flex items-center justify-between gap-4 border-b border-zinc-800/80 pb-1.5 text-[10px] text-zinc-500">
+                    <span className="inline-flex items-center gap-1.5 font-medium text-emerald-300">
+                      <Sparkles className="h-3 w-3 animate-pulse" />
+                      Streaming from {MODELS.find((m) => m.id === selectedModel)?.label || selectedModel}…
+                    </span>
+                  </div>
+                  <FormattedReply text={streamingText} />
+                </div>
               </div>
-            </div>
-          )}
+            ) : (
+              <div className="flex justify-start">
+                <div className="inline-flex items-center gap-2.5 rounded-2xl border border-zinc-800 bg-zinc-900/70 px-4 py-3 text-xs text-zinc-300">
+                  <div className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-zinc-700 border-t-emerald-400" />
+                  {streamingStatus ||
+                    `Analyzing your household balance sheet & tax profile with ${
+                      MODELS.find((m) => m.id === selectedModel)?.label
+                    }…`}
+                </div>
+              </div>
+            ))}
 
           {chatError && (
             <div className="flex items-start gap-2 rounded-xl border border-rose-500/30 bg-rose-500/10 p-3 text-xs text-rose-200">
